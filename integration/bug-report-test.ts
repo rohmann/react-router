@@ -1,15 +1,15 @@
+import fs from "node:fs";
+import path from "node:path";
 import { test, expect } from "@playwright/test";
+import getPort from "get-port";
 
-import { PlaywrightFixture } from "./helpers/playwright-fixture.js";
-import type { Fixture, AppFixture } from "./helpers/create-fixture.js";
+import { js } from "./helpers/create-fixture.js";
 import {
-  createAppFixture,
-  createFixture,
-  js,
-} from "./helpers/create-fixture.js";
-
-let fixture: Fixture;
-let appFixture: AppFixture;
+  createProject,
+  dev,
+  reactRouterConfig,
+  viteConfig,
+} from "./helpers/vite.js";
 
 ////////////////////////////////////////////////////////////////////////////////
 // 👋 Hola! I'm here to help you write a great bug report pull request.
@@ -50,75 +50,101 @@ let appFixture: AppFixture;
 //    ```
 ////////////////////////////////////////////////////////////////////////////////
 
-test.beforeEach(async ({ context }) => {
-  await context.route(/\.data$/, async (route) => {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    route.continue();
+let stop: (() => unknown) | undefined;
+
+test.afterEach(() => stop?.());
+
+// This bug only reproduces against the dev server, so instead of
+// `createFixture`/`createAppFixture` (which build the app), this starts
+// `react-router dev` and requests a document directly. Each route module
+// records when the server evaluates it.
+async function getSsrRouteImports(prerender: string[] | undefined) {
+  let port = await getPort();
+  let cwd = await createProject({
+    "vite.config.js": await viteConfig.basic({ port }),
+    "react-router.config.ts": reactRouterConfig({ ssr: false, prerender }),
+    "app/routeImportTracker.ts": js`
+      // Records route module evaluation on the server only, synchronously
+      // so it can't race the document response
+      export function logImport(url: string) {
+        if (typeof document !== "undefined") return;
+        const fs = process.getBuiltinModule("node:fs");
+        fs.appendFileSync(process.cwd() + "/ssr-route-imports.txt", url + "\n");
+      }
+    `,
+    "app/root.tsx": js`
+      import { Links, Meta, Outlet, Scripts } from "react-router";
+      import { logImport } from "./routeImportTracker";
+      logImport("app/root.tsx");
+
+      export default function Root() {
+        return (
+          <html lang="en">
+            <head>
+              <Meta />
+              <Links />
+            </head>
+            <body>
+              <Outlet />
+              <Scripts />
+            </body>
+          </html>
+        );
+      }
+
+      export function HydrateFallback() {
+        return <p>Loading...</p>;
+      }
+    `,
+    "app/routes/_index.tsx": js`
+      import { logImport } from "../routeImportTracker";
+      logImport("app/routes/_index.tsx");
+
+      export default function Component() {
+        return <h2>Index</h2>;
+      }
+    `,
+    "app/routes/about.tsx": js`
+      import { logImport } from "../routeImportTracker";
+      logImport("app/routes/about.tsx");
+
+      export default function Component() {
+        return <h2>About</h2>;
+      }
+    `,
   });
-});
 
-test.beforeAll(async () => {
-  fixture = await createFixture({
-    ////////////////////////////////////////////////////////////////////////////
-    // 💿 Next, add files to this object, just like files in a real app,
-    // `createFixture` will make an app and run your tests against it.
-    ////////////////////////////////////////////////////////////////////////////
-    files: {
-      "app/routes/_index.tsx": js`
-        import { useLoaderData, Link } from "react-router";
+  stop = await dev({ cwd, port });
+  let res = await fetch(`http://localhost:${port}/`);
+  expect(res.status).toBe(200);
+  await res.text();
 
-        export function loader() {
-          return "pizza";
-        }
-
-        export default function Index() {
-          let data = useLoaderData();
-          return (
-            <div>
-              {data}
-              <Link to="/burgers">Other Route</Link>
-            </div>
-          )
-        }
-      `,
-
-      "app/routes/burgers.tsx": js`
-        export default function Index() {
-          return <div>cheeseburger</div>;
-        }
-      `,
-    },
-  });
-
-  // This creates an interactive app using playwright.
-  appFixture = await createAppFixture(fixture);
-});
-
-test.afterAll(() => {
-  appFixture.close();
-});
+  let imports = await fs.promises.readFile(
+    path.join(cwd, "ssr-route-imports.txt"),
+    "utf-8",
+  );
+  return imports.trim().split("\n").sort();
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 // 💿 Almost done, now write your failing test case(s) down here Make sure to
 // add a good description for what you expect React Router to do 👇🏽
 ////////////////////////////////////////////////////////////////////////////////
 
-test("[description of what you expect it to do]", async ({ page }) => {
-  let app = new PlaywrightFixture(appFixture, page);
-  // You can test any request your app might get using `fixture`.
-  let response = await fixture.requestDocument("/");
-  expect(await response.text()).toMatch("pizza");
+// Passes: in SPA Mode, non-root routes are stubbed out of the server build.
+test("ssr:false dev server only imports the root route without a prerender config (SPA Mode)", async () => {
+  expect(await getSsrRouteImports(undefined)).toStrictEqual(["app/root.tsx"]);
+});
 
-  // If you need to test interactivity use the `app`
-  await app.goto("/");
-  await app.clickLink("/burgers");
-  await page.waitForSelector("text=cheeseburger");
-
-  // If you're not sure what's going on, you can "poke" the app, it'll
-  // automatically open up in your browser for 20 seconds, so be quick!
-  // await app.poke(20);
-
-  // Go check out the other tests to see what else you can do.
+// Fails: with any prerender config, every route module is imported into the
+// server build, including routes no prerender path ever matches. In large apps
+// this makes the first dev request evaluate the entire app on the server.
+test("ssr:false dev server only imports routes matched by prerender paths", async () => {
+  expect(await getSsrRouteImports(["/"])).toStrictEqual([
+    "app/root.tsx",
+    "app/routes/_index.tsx",
+    // app/routes/about.tsx is never pre-rendered, so it should not be imported
+  ]);
 });
 
 ////////////////////////////////////////////////////////////////////////////////
